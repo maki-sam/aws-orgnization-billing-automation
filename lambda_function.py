@@ -11,31 +11,38 @@ Metric      : UnblendedCost  (same metric the AWS Console uses)
 Cost basis (COST_BASIS env var)
 -------------------------------
 "console" (default)
-    Matches the AWS Console: Billing -> Bills page and Cost Explorer's
-    default view. Costs are NET of credits and refunds. Credits/refunds
-    appear as their own row per account so the sheet stays transparent.
+    Per-account SERVICE ROWS match the Billing -> Bills page:
+      * each service line is NET of SPP discount, bundled discount and
+        credits/refunds (the Bills page nets these into each line)
+      * "Amazon Elastic Compute Cloud - Compute" and "EC2 - Other" are
+        merged into one "Elastic Compute Cloud" line like the Bills page
+      * data-transfer usage is broken out into its own "Data Transfer"
+        line like the Bills page (see DATA_TRANSFER_SPLIT below)
+      * service names use the console's display style ("WAF", not
+        "AWS WAF")
+    SPP and Credits/Refunds are still shown per account as INFORMATIONAL
+    rows below the SubTotal (their amounts are already inside the service
+    rows, so they are not added again). The rollup sheets (Total Cost for
+    All Accounts, SPP for All Accounts, Bundled_Discount) keep their
+    structure and their SPP/credit amounts unchanged.
 "invoice"
-    Old behaviour: GROSS of credits/refunds, matching the invoice PDF
-    (credits arrive as separate credit memos, not netted into line items).
-
-Why the previous version didn't match the console
---------------------------------------------------
-1. It excluded Credit/Refund records; the console is net of them.
-2. It rounded every service amount to 2 dp before summing; the console
-   sums full precision. This version stores full-precision values and
-   lets the Excel number format handle display.
-3. Discount record types other than SPP/Bundled (e.g. EDP, Distributor)
-   were excluded but never added back. This version only pulls out the
-   types it reports separately and leaves everything else in the data.
+    Legacy behaviour: service rows GROSS of discounts/credits, SPP added
+    below SubTotal, matching the invoice PDF.
 
 Environment variables
 ----------------------
-SENDER_EMAIL      e.g. reports@yourdomain.com   (must be SES-verified)
-RECIPIENT_EMAILS  comma-separated, e.g. you@x.com,boss@x.com
-REPORT_PREFIX     optional, default "CB_Bank"
-COST_BASIS        optional, "console" (default) or "invoice"
-ACCOUNT_SORT      optional, "cost" (default, highest spender first) or "name"
-SES_REGION        optional, default us-east-1
+SENDER_EMAIL         e.g. reports@yourdomain.com   (must be SES-verified)
+RECIPIENT_EMAILS     comma-separated, e.g. you@x.com,boss@x.com
+REPORT_PREFIX        optional, default "CB_Bank"
+COST_BASIS           optional, "console" (default) or "invoice"
+ACCOUNT_SORT         optional, "cost" (default) or "name"
+SES_REGION           optional, default us-east-1
+DATA_TRANSFER_SPLIT  optional, "true" (default) — break data-transfer
+                     usage out into its own service row like the console
+DT_SOURCE_SERVICES   optional, comma-separated Cost Explorer service names
+                     to pull data-transfer usage types out of. Default:
+                     "EC2 - Other,Amazon Virtual Private Cloud,
+                      Amazon Simple Storage Service"
 
 IAM permissions required
 ------------------------
@@ -125,6 +132,13 @@ def _ce_query(start, end, group_by, flt=None):
         kwargs["NextPageToken"] = token
 
 
+def _not_tax_filter(tax_types):
+    if not tax_types:
+        return None
+    return {"Not": {"Dimensions": {"Key": "RECORD_TYPE",
+                                   "Values": sorted(tax_types)}}}
+
+
 def get_account_names():
     """{account_id: name} from Organizations."""
     names = {}
@@ -146,9 +160,9 @@ def discover_record_types(start, end):
 
 
 def classify_record_types(record_types):
-    """Split the month's record types into the buckets the report shows
-    on their own rows. Everything NOT returned here stays in the main
-    per-service data, so no record type is ever silently dropped."""
+    """Split the month's record types into the buckets the report handles
+    specially. Everything NOT returned here stays in the main per-service
+    data, so no record type is ever silently dropped."""
     tax = {t for t in record_types if t.lower() == "tax"}
     credit = {t for t in record_types if t.lower() in ("credit", "refund")}
     spp = {t for t in record_types
@@ -157,18 +171,33 @@ def classify_record_types(record_types):
     return tax, credit, spp, bundled
 
 
+def get_net_costs_by_account_service(start, end, tax_types):
+    """CONSOLE basis: {account_id: {service: net_cost}}.
+    Includes usage, fees, Savings Plan records, credits, refunds and every
+    discount record; excludes only Tax (which has its own row). Because
+    Cost Explorer attributes discount and credit records to the service
+    they apply to, each service line comes out NET — exactly how the
+    Bills page presents it."""
+    costs = {}
+    for (acct, service), amount in _ce_query(
+            start, end,
+            [{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"},
+             {"Type": "DIMENSION", "Key": "SERVICE"}],
+            _not_tax_filter(tax_types)):
+        costs.setdefault(acct, {})
+        costs[acct][service] = costs[acct].get(service, 0.0) + amount
+    return costs
+
+
 def get_costs_by_account_service(start, end, exclude_record_types):
-    """{account_id: {service: cost}} — UnblendedCost, full precision.
-    Only the record types reported on separate rows (Tax, Credit/Refund,
-    SPP, Bundled) are excluded; all other charges stay here so the totals
-    reconcile with the console."""
+    """INVOICE basis (legacy): {account_id: {service: gross_cost}} —
+    UnblendedCost gross of credits/discounts, Tax excluded."""
     flt = None
     if exclude_record_types:
         flt = {"Not": {"Dimensions": {
             "Key": "RECORD_TYPE",
             "Values": sorted(exclude_record_types),
         }}}
-
     costs = {}
     for (acct, service), amount in _ce_query(
             start, end,
@@ -203,6 +232,83 @@ def get_special_records(start, end, tax_types, credit_types,
         elif rtype in bundled_types:
             bundled[acct] = bundled.get(acct, 0.0) + amount
     return tax, credits, spp, bundled
+
+
+# ---------------------------------------------------------- console view
+# The Bills page breaks bandwidth out into its own "Data Transfer" service
+# line, while Cost Explorer folds it into the owning service (mostly
+# "EC2 - Other"). These usage-type markers identify the bandwidth records
+# so they can be moved into a "Data Transfer" row like the console.
+# CloudFront bandwidth stays under CloudFront on the Bills page, hence the
+# exclusion.
+DT_UT_MARKERS = ("DataTransfer", "-AWS-Out-Bytes", "-AWS-In-Bytes")
+
+
+def _is_data_transfer_usage_type(usage_type):
+    if "CloudFront" in usage_type:
+        return False
+    return any(m in usage_type for m in DT_UT_MARKERS)
+
+
+def split_data_transfer(start, end, tax_types, costs):
+    """Move data-transfer usage types out of their Cost Explorer service
+    and into a 'Data Transfer' row, mirroring the Bills page. One extra
+    query per source service (grouped by account + usage type)."""
+    if os.environ.get("DATA_TRANSFER_SPLIT", "true").lower() != "true":
+        return
+    sources = [s.strip() for s in os.environ.get(
+        "DT_SOURCE_SERVICES",
+        "EC2 - Other,Amazon Virtual Private Cloud,"
+        "Amazon Simple Storage Service").split(",") if s.strip()]
+
+    for svc in sources:
+        parts = [{"Dimensions": {"Key": "SERVICE", "Values": [svc]}}]
+        not_tax = _not_tax_filter(tax_types)
+        if not_tax:
+            parts.append(not_tax)
+        flt = parts[0] if len(parts) == 1 else {"And": parts}
+
+        for (acct, usage_type), amount in _ce_query(
+                start, end,
+                [{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"},
+                 {"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+                flt):
+            if not _is_data_transfer_usage_type(usage_type):
+                continue
+            acct_costs = costs.get(acct)
+            if not acct_costs or svc not in acct_costs:
+                continue
+            acct_costs[svc] -= amount
+            acct_costs["Data Transfer"] = (
+                acct_costs.get("Data Transfer", 0.0) + amount)
+
+
+# The Bills page merges Cost Explorer's two EC2 entries into one line and
+# drops the "Amazon"/"AWS" vendor prefix from most service names.
+CONSOLE_NAME_OVERRIDES = {
+    "Amazon Elastic Compute Cloud - Compute": "Elastic Compute Cloud",
+    "EC2 - Other": "Elastic Compute Cloud",
+    "AmazonCloudWatch": "CloudWatch",
+}
+
+
+def console_service_name(name):
+    if name in CONSOLE_NAME_OVERRIDES:
+        return CONSOLE_NAME_OVERRIDES[name]
+    return re.sub(r"^(?:Amazon|AWS)\s+", "", name)
+
+
+def to_console_view(costs):
+    """Rename services to console display names and merge rows that map to
+    the same console line (the two EC2 entries)."""
+    out = {}
+    for acct, svcs in costs.items():
+        merged = {}
+        for svc, amount in svcs.items():
+            key = console_service_name(svc)
+            merged[key] = merged.get(key, 0.0) + amount
+        out[acct] = merged
+    return out
 
 
 # ================================================================ excel
@@ -259,14 +365,20 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
                    cost_basis):
     """
     accounts : ordered list of (account_id, account_name)
-    costs    : {acct: {service: cost}}
+    costs    : {acct: {service: cost}}   (net console view, or legacy gross)
     tax/credits/spp/bundled : {acct: amount}
-    cost_basis : "console" (credits row shown, totals net) or "invoice"
+    cost_basis : "console" or "invoice"
 
-    NOTE: amounts are written at FULL precision (the money number format
-    displays 2 dp). Rounding each row before summing is what made the old
-    report drift from the console by a few cents.
+    Console basis per-account sheet:
+        service rows (net) / Tax  -> SubTotal  == console account total
+        SPP + Credits shown BELOW SubTotal as information only (their
+        amounts are already inside the service rows), Total = SubTotal.
+    Invoice basis: legacy layout (gross rows, Total = SubTotal + SPP).
+
+    Amounts are written at FULL precision (the money format displays 2 dp)
+    so sums match the console to the cent.
     """
+    net_view = cost_basis == "console"
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -308,28 +420,47 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
         _cell(ws, row, 3, tax.get(acct_id, 0.0), money=True)
         row += 1
 
-        # Credits/Refunds row (console basis only): the console is net of
-        # credits, so they must sit INSIDE the SubTotal for totals to match.
-        if cost_basis == "console":
-            _cell(ws, row, 2, "Credits & Refunds")
+        if net_view:
+            # Console basis: service rows are already net of SPP, bundled
+            # discounts and credits, so SubTotal == the console's account
+            # total. SPP and Credits appear below as information only.
+            subtotal_row = row
+            _cell(ws, row, 2, "SubTotal", bold=True)
+            _cell(ws, row, 3, f"=SUM(C3:C{row - 1})", bold=True,
+                  money=True, fill=TOTAL_FILL)
+            row += 1
+
+            spp_row = row
+            _cell(ws, row, 2, "SPP (already included in costs above)",
+                  bold=True)
+            _cell(ws, row, 3, spp.get(acct_id, 0.0), money=True)
+            row += 1
+
+            _cell(ws, row, 2, "Credits & Refunds (already included above)")
             _cell(ws, row, 3, credits.get(acct_id, 0.0), money=True)
             row += 1
 
-        subtotal_row = row
-        _cell(ws, row, 2, "SubTotal", bold=True)
-        _cell(ws, row, 3, f"=SUM(C3:C{row - 1})", bold=True,
-              money=True, fill=TOTAL_FILL)
-        row += 1
+            total_row = row
+            _cell(ws, row, 2, "Total", bold=True)
+            _cell(ws, row, 3, f"=C{subtotal_row}", bold=True,
+                  money=True, fill=TOTAL_FILL)
+        else:
+            # Invoice basis (legacy): gross rows, SPP added into Total.
+            subtotal_row = row
+            _cell(ws, row, 2, "SubTotal", bold=True)
+            _cell(ws, row, 3, f"=SUM(C3:C{row - 1})", bold=True,
+                  money=True, fill=TOTAL_FILL)
+            row += 1
 
-        spp_row = row
-        _cell(ws, row, 2, "SPP", bold=True)
-        _cell(ws, row, 3, spp.get(acct_id, 0.0), money=True)
-        row += 1
+            spp_row = row
+            _cell(ws, row, 2, "SPP", bold=True)
+            _cell(ws, row, 3, spp.get(acct_id, 0.0), money=True)
+            row += 1
 
-        total_row = row
-        _cell(ws, row, 2, "Total", bold=True)
-        _cell(ws, row, 3, f"=SUM(C{subtotal_row}:C{spp_row})", bold=True,
-              money=True, fill=TOTAL_FILL)
+            total_row = row
+            _cell(ws, row, 2, "Total", bold=True)
+            _cell(ws, row, 3, f"=SUM(C{subtotal_row}:C{spp_row})", bold=True,
+                  money=True, fill=TOTAL_FILL)
 
         _autofit(ws, {"B": 52, "C": 14})
         anchors[acct_id] = dict(
@@ -416,9 +547,18 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
     _cell(ws_csb, sub, 5, f"=SUM(E{first}:E{last})", bold=True, money=True)
     _cell(ws_csb, sub, 6, f"=SUM(F{first}:F{last})", bold=True, money=True)
     tc = sub + 1
-    _cell(ws_csb, tc, 2, "Total Cost", bold=True)
-    _merge(ws_csb, f"B{tc}:C{tc}")
-    _cell(ws_csb, tc, 4, f"=D{sub}+E{sub}+F{sub}", bold=True, money=True)
+    if net_view:
+        # Cost column is already net of SPP/Bundled — adding columns E and
+        # F again would double-count the discounts.
+        _cell(ws_csb, tc, 2,
+              "Total Cost (SPP & Bundled already included in Cost)",
+              bold=True)
+        _merge(ws_csb, f"B{tc}:C{tc}")
+        _cell(ws_csb, tc, 4, f"=D{sub}", bold=True, money=True)
+    else:
+        _cell(ws_csb, tc, 2, "Total Cost", bold=True)
+        _merge(ws_csb, f"B{tc}:C{tc}")
+        _cell(ws_csb, tc, 4, f"=D{sub}+E{sub}+F{sub}", bold=True, money=True)
     ws_csb.cell(row=tc, column=4).alignment = Alignment(horizontal="center")
     _merge(ws_csb, f"D{tc}:F{tc}", fill=TOTAL_FILL)
     _autofit(ws_csb, {"B": 22, "C": 16, "D": 14, "E": 14, "F": 16})
@@ -429,12 +569,15 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
     _header_row(ws_all, 3, 2, ["Account Name", "Account ID", "Total Cost"])
     for i, (acct_id, acct_name) in enumerate(accounts):
         r = first + i
+        if net_view:
+            formula = f"='Cost+SPP+Bundle Discount'!D{r}"
+        else:
+            formula = (f"='Cost+SPP+Bundle Discount'!D{r}"
+                       f"+'Cost+SPP+Bundle Discount'!E{r}"
+                       f"+'Cost+SPP+Bundle Discount'!F{r}")
         _cell(ws_all, r, 2, acct_name)
         _cell(ws_all, r, 3, acct_id)
-        _cell(ws_all, r, 4,
-              f"='Cost+SPP+Bundle Discount'!D{r}"
-              f"+'Cost+SPP+Bundle Discount'!E{r}"
-              f"+'Cost+SPP+Bundle Discount'!F{r}", money=True)
+        _cell(ws_all, r, 4, formula, money=True)
     _cell(ws_all, last + 1, 2, "Total", bold=True)
     _merge(ws_all, f"B{last + 1}:C{last + 1}")
     _cell(ws_all, last + 1, 4, f"=SUM(D{first}:D{last})", bold=True,
@@ -452,7 +595,7 @@ def send_report(wb_bytes, label, total_hint, cost_basis):
     prefix = os.environ.get("REPORT_PREFIX", "CB_Bank")
     filename = f"{prefix}_{label}_AWS_Cost_Report.xlsx"
 
-    basis_note = ("net of credits/refunds, as shown in the AWS Console"
+    basis_note = ("net of discounts and credits, as shown in the AWS Console"
                   if cost_basis == "console"
                   else "as invoiced, before credits")
 
@@ -513,19 +656,22 @@ def lambda_handler(event, context):
     tax_types, credit_types, spp_types, bundled_types = \
         classify_record_types(record_types)
 
-    # Only pull out record types the report shows on dedicated rows.
-    # Any other type (EDP discount, fees, Savings Plan records, ...) stays
-    # in the per-service data so nothing is dropped from the totals.
-    costs = get_costs_by_account_service(
-        start, end,
-        exclude_record_types=(tax_types | credit_types
-                              | spp_types | bundled_types))
     tax, credits, spp, bundled = get_special_records(
         start, end, tax_types, credit_types, spp_types, bundled_types)
 
-    if cost_basis == "invoice":
-        # Invoice PDF is gross of credits: drop them entirely.
-        credits = {}
+    if cost_basis == "console":
+        # Service rows NET of discounts/credits, grouped/named like the
+        # Bills page. SPP/credits stay available for the info rows and
+        # rollup sheets — their amounts are already inside the service rows.
+        costs = get_net_costs_by_account_service(start, end, tax_types)
+        split_data_transfer(start, end, tax_types, costs)
+        costs = to_console_view(costs)
+    else:
+        # Legacy invoice basis: gross of credits/discounts.
+        costs = get_costs_by_account_service(
+            start, end,
+            exclude_record_types=(tax_types | credit_types
+                                  | spp_types | bundled_types))
 
     # Account list = every account in the Organization, plus any account that
     # appears in cost data but is no longer in the org (e.g. removed mid-month).
@@ -533,8 +679,10 @@ def lambda_handler(event, context):
                | set(spp) | set(bundled))
 
     def month_total(a):
-        return (sum(costs.get(a, {}).values()) + tax.get(a, 0.0)
-                + credits.get(a, 0.0) + spp.get(a, 0.0) + bundled.get(a, 0.0))
+        base = sum(costs.get(a, {}).values()) + tax.get(a, 0.0)
+        if cost_basis == "console":
+            return base   # SPP/bundled/credits already inside service rows
+        return base + spp.get(a, 0.0) + bundled.get(a, 0.0)
 
     if os.environ.get("ACCOUNT_SORT", "cost").lower() == "name":
         ordered = sorted(all_ids, key=lambda a: names.get(a, a).lower())
@@ -550,10 +698,14 @@ def lambda_handler(event, context):
     wb.save(buf)
     wb_bytes = buf.getvalue()
 
-    gross = (sum(sum(svcs.values()) for svcs in costs.values())
-             + sum(tax.values()) + sum(spp.values()) + sum(bundled.values()))
+    total = sum(month_total(a) for a in all_ids)
     credits_total = sum(credits.values())
-    total = gross + credits_total   # == gross when basis is "invoice"
+    if cost_basis == "console":
+        console_total = total
+        invoice_total = total - credits_total
+    else:
+        invoice_total = total
+        console_total = total + credits_total
 
     filename = send_report(wb_bytes, label, total, cost_basis)
     return {
@@ -561,7 +713,10 @@ def lambda_handler(event, context):
         "file": filename,
         "period": f"{start}..{end}",
         "cost_basis": cost_basis,
-        "total": round(total, 2),               # compare this to the console
+        "total": round(total, 2),
+        "console_total": round(console_total, 2),   # matches Bills page
+        "invoice_total": round(invoice_total, 2),   # matches invoice PDF
         "credits_refunds": round(credits_total, 2),
-        "gross_before_credits": round(gross, 2),  # compare to invoice PDF
+        "spp_total": round(sum(spp.values()), 2),
+        "bundled_total": round(sum(bundled.values()), 2),
     }

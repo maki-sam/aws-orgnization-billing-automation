@@ -124,7 +124,18 @@ The response now shows **both** totals plus the credit amount, so a console-vs-i
 
 ---
 
-## 9. How to Verify the Fix
+## 9. Update (2026-07-16) — Option 2: Console-View Service Rows
+
+Per-account **service rows now match the Bills page view** (console basis):
+
+- Each service line is **net** of SPP discount, bundled discount and credits/refunds — the same netting the Bills page applies per line.
+- Cost Explorer's "Amazon Elastic Compute Cloud - Compute" + "EC2 - Other" are **merged into one "Elastic Compute Cloud" line**, and data-transfer usage types are **broken out into a "Data Transfer" line**, mirroring the Bills page grouping (`DATA_TRANSFER_SPLIT` / `DT_SOURCE_SERVICES` env vars control this).
+- Service names use the console display style ("WAF", not "AWS WAF").
+- SubTotal per account = the console's account total; **SPP and Credits appear below SubTotal as informational rows** (their amounts are already inside the service lines, so they are not added again; Total = SubTotal).
+- **Unchanged as requested:** sheet structure and all SPP/credit amounts in *Total Cost for All Accounts*, *SPP for All Accounts* and *Bundled_Discount*. The *Cost+SPP+Bundle Discount* and *All Total* sheets no longer re-add SPP/Bundled (that would double-count now that Cost is net).
+- The legacy gross layout is still available with `COST_BASIS=invoice`.
+
+## 10. How to Verify the Fix
 
 1. Deploy the new `lambda_function.py`.
 2. Invoke with a **closed** month (the console's current month is an estimate):
