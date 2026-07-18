@@ -491,8 +491,7 @@ class BillingCollector:
             return self._transfer_target(raw_service, usage_type) or self._normalized_service_map.get(raw_normalized, raw_service)
         return self._normalized_service_map.get(raw_normalized, raw_service)
 
-    @staticmethod
-    def _transfer_target(raw_service: str, usage_type: str) -> str | None:
+    def _transfer_target(self, raw_service: str, usage_type: str) -> str | None:
         """Return Data Transfer only for the CE rows verified against Bills.
 
         The Bills view assigns DataTransfer/DataXfer usage to Data Transfer,
@@ -502,7 +501,7 @@ class BillingCollector:
         service = normalize(raw_service)
         usage = normalize(usage_type)
         if service not in {normalize("Data Transfer"), normalize("AWS Data Transfer")} and any(
-            pattern in usage for pattern in ("datatransfer", "dataxfer")
+            pattern and pattern in usage for pattern in self._transfer_patterns
         ):
             return "Data Transfer"
         if service in {
@@ -823,13 +822,13 @@ class ExcelReportBuilder:
         self._title(
             worksheet,
             f"{dataset.month_label} AWS Costs for all accounts",
-            5,
+            4,
         )
         self._headers(
             worksheet,
             3,
             2,
-            ["Account Name", "Account ID", "Final Cost", "Currency"],
+            ["Account Name", "Account ID", "Total Cost"],
         )
 
         row = 4
@@ -839,36 +838,29 @@ class ExcelReportBuilder:
             worksheet.cell(row, 2, account.name)
             worksheet.cell(row, 3, account.account_id)
             worksheet.cell(row, 4, float(breakdown.direct_total))
-            worksheet.cell(row, 5, breakdown.unit)
             organization_total += breakdown.direct_total
             row += 1
 
         worksheet.cell(row, 2, "Total").font = Font(bold=True)
         worksheet.cell(row, 4, float(organization_total)).font = Font(bold=True)
-        for column in range(2, 6):
+        for column in range(2, 5):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
 
         self._currency_cells(worksheet, range(4, row + 1), [4])
-        self._set_widths(worksheet, {2: 36, 3: 18, 4: 20, 5: 12})
+        self._set_widths(worksheet, {2: 36, 3: 18, 4: 20})
         worksheet.freeze_panes = "B4"
-        worksheet.auto_filter.ref = f"B3:E{max(3, row - 1)}"
+        worksheet.auto_filter.ref = f"B3:D{max(3, row - 1)}"
 
     def _write_components(self, workbook: Workbook, dataset: BillingDataset) -> None:
         worksheet = self._new_sheet(workbook, "Cost+SPP+Bundle Discount")
-        self._title(worksheet, f"{dataset.month_label} AWS Cost Components", 12)
+        self._title(worksheet, f"{dataset.month_label} AWS Costs for all accounts", 6)
         headers = [
             "Account Name",
             "Account ID",
-            "Base Cost",
-            "Savings Plans",
-            "SPP",
-            "Bundled Discount",
-            "Credits",
-            "Refunds",
-            "Tax",
-            "Other Discount",
-            "Final Cost",
+            "Cost",
+            "SPP Charges",
+            "Bundled Charges",
         ]
         self._headers(worksheet, 3, 2, headers)
 
@@ -881,14 +873,8 @@ class ExcelReportBuilder:
                 account.name,
                 account.account_id,
                 components["base"],
-                components["savings_plans"],
                 components["spp"],
                 components["bundled"],
-                components["credit"],
-                components["refund"],
-                components["tax"],
-                components["other_discount"],
-                breakdown.direct_total,
             ]
             for column, value in enumerate(values, 2):
                 worksheet.cell(
@@ -900,20 +886,27 @@ class ExcelReportBuilder:
                 totals[key] += values[index + 2]
             row += 1
 
-        worksheet.cell(row, 2, "Total").font = Font(bold=True)
+        worksheet.cell(row, 2, "Sub Total").font = Font(bold=True)
         for index, key in enumerate(headers[2:], start=4):
             worksheet.cell(row, index, float(totals[key])).font = Font(bold=True)
-        for column in range(2, 13):
+        for column in range(2, 7):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
 
-        self._currency_cells(worksheet, range(4, row + 1), range(4, 13))
+        row += 1
+        worksheet.cell(row, 2, "Total Cost").font = Font(bold=True)
+        worksheet.cell(row, 4, float(totals["Cost"])).font = Font(bold=True)
+        for column in range(2, 7):
+            worksheet.cell(row, column).fill = self.TOTAL_FILL
+            worksheet.cell(row, column).border = self.TOP_BORDER
+
+        self._currency_cells(worksheet, range(4, row + 1), range(4, 7))
         self._set_widths(
             worksheet,
-            {2: 36, 3: 18, **{column: 18 for column in range(4, 13)}},
+            {2: 36, 3: 18, **{column: 18 for column in range(4, 7)}},
         )
         worksheet.freeze_panes = "B4"
-        worksheet.auto_filter.ref = f"B3:L{max(3, row - 1)}"
+        worksheet.auto_filter.ref = f"B3:F{max(3, row - 2)}"
 
     def _write_account_category_summary(
         self,
@@ -927,9 +920,6 @@ class ExcelReportBuilder:
     ) -> None:
         worksheet = self._new_sheet(workbook, sheet_name)
         headers = ["Account Name", "Account ID", amount_header]
-        if include_magnitude:
-            headers.append("Display Magnitude")
-        headers.append("Currency")
         end_column = 2 + len(headers) - 1
         self._title(worksheet, title, end_column)
         self._headers(worksheet, 3, 2, headers)
@@ -943,30 +933,20 @@ class ExcelReportBuilder:
             worksheet.cell(row, 2, account.name)
             worksheet.cell(row, 3, account.account_id)
             worksheet.cell(row, 4, float(amount))
-            if include_magnitude:
-                worksheet.cell(row, 5, float(abs(amount)))
-                worksheet.cell(row, 6, breakdown.unit)
-            else:
-                worksheet.cell(row, 5, breakdown.unit)
             total_impact += amount
-            total_magnitude += abs(amount)
             row += 1
 
         worksheet.cell(row, 2, "Total").font = Font(bold=True)
         worksheet.cell(row, 4, float(total_impact)).font = Font(bold=True)
-        if include_magnitude:
-            worksheet.cell(row, 5, float(total_magnitude)).font = Font(bold=True)
-
-        last_column = 6 if include_magnitude else 5
+        last_column = 4
         for column in range(2, last_column + 1):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
 
-        currency_columns = [4, 5] if include_magnitude else [4]
-        self._currency_cells(worksheet, range(4, row + 1), currency_columns)
+        self._currency_cells(worksheet, range(4, row + 1), [4])
         self._set_widths(
             worksheet,
-            {2: 36, 3: 18, 4: 22, 5: 22, 6: 12},
+            {2: 36, 3: 18, 4: 22},
         )
         worksheet.freeze_panes = "B4"
         worksheet.auto_filter.ref = (
@@ -1298,6 +1278,27 @@ class ExcelReportBuilder:
 
         return errors
 
+    def _reconciliation_errors(self, dataset: BillingDataset) -> list[str]:
+        """Keep the Lambda safety check without adding a worksheet."""
+        errors: list[str] = []
+        for account in dataset.accounts:
+            breakdown = dataset.account_breakdowns[account.account_id]
+            record_diff = breakdown.direct_total - sum(
+                breakdown.record_types.values(), ZERO
+            )
+            service_diff = breakdown.direct_total - sum(
+                breakdown.display_services.values(), ZERO
+            )
+            if (
+                abs(record_diff) > self.config.tolerance
+                or abs(service_diff) > self.config.tolerance
+            ):
+                errors.append(
+                    f"{account.name} ({account.account_id}): "
+                    f"direct-record={record_diff}, direct-service={service_diff}"
+                )
+        return errors
+
     def _write_account_sheets(self, workbook: Workbook, dataset: BillingDataset) -> None:
         """Each account sheet intentionally contains only Service and Cost."""
         for account in dataset.accounts:
@@ -1353,75 +1354,27 @@ class ExcelReportBuilder:
             workbook,
             dataset,
             "Total Cost for All Accounts",
-            f"{dataset.month_label} Base Cost for all accounts",
+            f"{dataset.month_label} AWS Costs for all accounts",
             "base",
-            "Base Cost",
+            "Cost",
         )
-        self._write_account_category_summary(
-            workbook,
-            dataset,
-            "Savings Plans",
-            f"{dataset.month_label} Savings Plans by account",
-            "savings_plans",
-            "Savings Plans Bill Impact",
-            include_magnitude=True,
-        )
-        self._write_savings_plan_utilization(workbook, dataset)
         self._write_account_category_summary(
             workbook,
             dataset,
             "SPP for All Accounts",
             f"{dataset.month_label} Solution Provider Program Discounts",
             "spp",
-            "SPP Bill Impact",
-            include_magnitude=True,
-        )
-        self._write_category_sheet(
-            workbook,
-            dataset,
-            "SPP Detail",
-            f"{dataset.month_label} SPP Billing Records",
-            "spp",
+            "SPP Discounts",
         )
         self._write_account_category_summary(
             workbook,
             dataset,
             "Bundled_Discount",
-            f"{dataset.month_label} Bundled Discounts by account",
+            f"{dataset.month_label} Bundled Discounts",
             "bundled",
-            "Bundled Bill Impact",
-            include_magnitude=True,
+            "Bundled Discount",
         )
-        self._write_category_sheet(
-            workbook,
-            dataset,
-            "Bundled Detail",
-            f"{dataset.month_label} Bundled Discount Billing Records",
-            "bundled",
-        )
-        self._write_category_sheet(
-            workbook,
-            dataset,
-            "Credits",
-            f"{dataset.month_label} Credits",
-            "credit",
-        )
-        self._write_category_sheet(
-            workbook,
-            dataset,
-            "Refunds",
-            f"{dataset.month_label} Refunds",
-            "refund",
-        )
-        self._write_category_sheet(
-            workbook,
-            dataset,
-            "Other Discounts",
-            f"{dataset.month_label} Other Discounts",
-            "other_discount",
-        )
-        self._write_record_types(workbook, dataset)
-        reconciliation_errors = self._write_reconciliation(workbook, dataset)
+        reconciliation_errors = self._reconciliation_errors(dataset)
         self._write_account_sheets(workbook, dataset)
 
         workbook.calculation.fullCalcOnLoad = True
