@@ -10,8 +10,9 @@ Design:
 - openpyxl must be supplied by a Lambda layer.
 - Account worksheets contain only: Service | Cost.
 - Account service costs use Cost Explorer SERVICE + USAGE_TYPE with
-  NetUnblendedCost by default, then merge common AWS Bills service names and
-  reclassify matching data-transfer usage into the Data Transfer service.
+  NetUnblendedCost by default. Marketplace products keep their Cost Explorer
+  product-service label; narrowly scoped EC2/ELB transfer rows are moved into
+  Data Transfer in the same query.
 
 Required environment variables:
 - SES_SENDER
@@ -25,7 +26,6 @@ Recommended environment variables:
 - SERVICE_METRIC                 Default: NetUnblendedCost
 - SPP_RECORD_TYPES               Default: Solution Provider Program Discount
 - BUNDLED_RECORD_TYPES           Default: Bundled Discount,BundledDiscount
-- DATA_TRANSFER_USAGE_PATTERNS   Default: DataTransfer,DataXfer
 - RECLASSIFY_DATA_TRANSFER       Default: true
 - SERVICE_NAME_MAP_JSON          Optional JSON object for custom name overrides
 - FAIL_ON_ESTIMATED              Default: true
@@ -487,16 +487,32 @@ class BillingCollector:
 
     def _display_service_name(self, raw_service: str, usage_type: str) -> str:
         raw_normalized = normalize(raw_service)
-        usage_normalized = normalize(usage_type)
+        if self.config.reclassify_data_transfer:
+            return self._transfer_target(raw_service, usage_type) or self._normalized_service_map.get(raw_normalized, raw_service)
+        return self._normalized_service_map.get(raw_normalized, raw_service)
 
-        if (
-            self.config.reclassify_data_transfer
-            and raw_normalized not in {normalize("Data Transfer"), normalize("AWS Data Transfer")}
-            and any(pattern and pattern in usage_normalized for pattern in self._transfer_patterns)
+    @staticmethod
+    def _transfer_target(raw_service: str, usage_type: str) -> str | None:
+        """Return Data Transfer only for the CE rows verified against Bills.
+
+        The Bills view assigns DataTransfer/DataXfer usage to Data Transfer,
+        including the matching VPC rows. EC2 AWS in/out byte rows are the
+        additional transfer class needed for this account.
+        """
+        service = normalize(raw_service)
+        usage = normalize(usage_type)
+        if service not in {normalize("Data Transfer"), normalize("AWS Data Transfer")} and any(
+            pattern in usage for pattern in ("datatransfer", "dataxfer")
         ):
             return "Data Transfer"
-
-        return self._normalized_service_map.get(raw_normalized, raw_service)
+        if service in {
+            normalize("Amazon Elastic Compute Cloud - Compute"),
+            normalize("EC2 - Other"),
+            normalize("Amazon Elastic Load Balancing"),
+            normalize("Elastic Load Balancing"),
+        } and any(pattern in usage for pattern in ("awsinbytes", "awsoutbytes")):
+            return "Data Transfer"
+        return None
 
     def get_display_services_for_account(
         self,
