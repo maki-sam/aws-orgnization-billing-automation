@@ -751,17 +751,16 @@ class ExcelReportBuilder:
         )
 
         row = 4
-        organization_total = ZERO
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
             worksheet.cell(row, 2, account.name)
             worksheet.cell(row, 3, account.account_id)
             worksheet.cell(row, 4, float(breakdown.direct_total))
-            organization_total += breakdown.direct_total
             row += 1
 
         worksheet.cell(row, 2, "Total").font = Font(bold=True)
-        worksheet.cell(row, 4, float(organization_total)).font = Font(bold=True)
+        total_formula = f"=SUM(D4:D{row - 1})" if row > 4 else 0
+        worksheet.cell(row, 4, total_formula).font = Font(bold=True)
         for column in range(2, 5):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
@@ -783,13 +782,10 @@ class ExcelReportBuilder:
         ]
         self._headers(worksheet, 3, 2, headers)
 
-        totals = {key: ZERO for key in headers[2:]}
-        organization_total = ZERO
         row = 4
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
             components = self._components(breakdown)
-            organization_total += breakdown.direct_total
             values: list[Any] = [
                 account.name,
                 account.account_id,
@@ -803,22 +799,24 @@ class ExcelReportBuilder:
                     column,
                     float(value) if isinstance(value, Decimal) else value,
                 )
-            for index, key in enumerate(headers[2:]):
-                totals[key] += values[index + 2]
             row += 1
 
         worksheet.cell(row, 2, "Sub Total").font = Font(bold=True)
-        for index, key in enumerate(headers[2:], start=4):
-            worksheet.cell(row, index, float(totals[key])).font = Font(bold=True)
+        for column in range(4, 7):
+            letter = get_column_letter(column)
+            formula = f"=SUM({letter}4:{letter}{row - 1})" if row > 4 else 0
+            worksheet.cell(row, column, formula).font = Font(bold=True)
         for column in range(2, 7):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
 
-        # Same figure as the "All Total" sheet's Total row: the sum of every
-        # account's direct_total, not just the three columns shown above.
+        # Same figure as the "All Total" sheet's Total row, referenced directly
+        # so the two sheets can never disagree. That cell sits one row below
+        # the per-account rows, which both sheets draw from dataset.accounts.
+        all_total_row = 4 + len(dataset.accounts)
         row += 1
         worksheet.cell(row, 2, "Total Cost").font = Font(bold=True)
-        worksheet.cell(row, 4, float(organization_total)).font = Font(bold=True)
+        worksheet.cell(row, 4, f"='All Total'!D{all_total_row}").font = Font(bold=True)
         for column in range(2, 7):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
@@ -847,18 +845,17 @@ class ExcelReportBuilder:
         self._headers(worksheet, 3, 2, headers)
 
         row = 4
-        total_impact = ZERO
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
             amount = self._components(breakdown)[category]
             worksheet.cell(row, 2, account.name)
             worksheet.cell(row, 3, account.account_id)
             worksheet.cell(row, 4, float(amount))
-            total_impact += amount
             row += 1
 
         worksheet.cell(row, 2, "Total").font = Font(bold=True)
-        worksheet.cell(row, 4, float(total_impact)).font = Font(bold=True)
+        total_formula = f"=SUM(D4:D{row - 1})" if row > 4 else 0
+        worksheet.cell(row, 4, total_formula).font = Font(bold=True)
         last_column = 4
         for column in range(2, last_column + 1):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
@@ -920,7 +917,6 @@ class ExcelReportBuilder:
             self._headers(worksheet, 3, 2, ["Service", "Cost"])
 
             row = 4
-            displayed_total = ZERO
             for service, amount in sorted(
                 breakdown.display_services.items(),
                 key=lambda item: item[0].lower(),
@@ -928,7 +924,6 @@ class ExcelReportBuilder:
                 display_amount = ZERO if abs(amount) < Decimal("0.005") else amount
                 worksheet.cell(row, 2, service)
                 worksheet.cell(row, 3, float(display_amount))
-                displayed_total += display_amount
                 row += 1
 
             if row == 4:
@@ -937,7 +932,7 @@ class ExcelReportBuilder:
                 row += 1
 
             worksheet.cell(row, 2, "Total").font = Font(bold=True)
-            worksheet.cell(row, 3, float(displayed_total)).font = Font(bold=True)
+            worksheet.cell(row, 3, f"=SUM(C4:C{row - 1})").font = Font(bold=True)
             for column in range(2, 4):
                 worksheet.cell(row, column).fill = self.TOTAL_FILL
                 worksheet.cell(row, column).border = self.TOP_BORDER
