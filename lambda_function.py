@@ -11,23 +11,28 @@ Metric      : UnblendedCost  (same metric the AWS Console uses)
 Cost basis (COST_BASIS env var)
 -------------------------------
 "console" (default)
-    Per-account SERVICE ROWS match the Billing -> Bills page:
-      * each service line is NET of SPP discount, bundled discount and
-        credits/refunds (the Bills page nets these into each line)
+    Per-account SERVICE ROWS are NET of credits/refunds (Cost Explorer
+    attributes those records to the service they apply to) but GROSS of
+    SPP and bundled discounts, which are broken out into their own rows
+    so the arithmetic is visible on every sheet:
+      * account sheet:  SubTotal + SPP + Bundled Discount = Total,
+        and Total equals the console's account total
+      * rollup sheet:   Cost + SPP Charges + Bundled Charges = All Total
       * "Amazon Elastic Compute Cloud - Compute" and "EC2 - Other" are
         merged into one "Elastic Compute Cloud" line like the Bills page
       * data-transfer usage is broken out into its own "Data Transfer"
         line like the Bills page (see DATA_TRANSFER_SPLIT below)
       * service names use the console's display style ("WAF", not
         "AWS WAF")
-    SPP and Credits/Refunds are still shown per account as INFORMATIONAL
-    rows below the SubTotal (their amounts are already inside the service
-    rows, so they are not added again). The rollup sheets (Total Cost for
-    All Accounts, SPP for All Accounts, Bundled_Discount) keep their
-    structure and their SPP/credit amounts unchanged.
+    NOTE: because SPP/bundled are no longer netted into each service
+    line, individual service rows read slightly higher than the Bills
+    page; the difference sits in the SPP / Bundled Discount rows and the
+    account TOTALS still match the console. Credits/Refunds remain an
+    informational row (already inside the service rows).
 "invoice"
-    Legacy behaviour: service rows GROSS of discounts/credits, SPP added
-    below SubTotal, matching the invoice PDF.
+    Legacy behaviour: service rows GROSS of discounts and credits
+    (credits excluded entirely), SPP and bundled added below SubTotal,
+    matching the invoice PDF.
 
 Environment variables
 ----------------------
@@ -132,11 +137,12 @@ def _ce_query(start, end, group_by, flt=None):
         kwargs["NextPageToken"] = token
 
 
-def _not_tax_filter(tax_types):
-    if not tax_types:
+def _exclude_record_types_filter(record_types):
+    """Not-filter for the given RECORD_TYPE values (None if empty)."""
+    if not record_types:
         return None
     return {"Not": {"Dimensions": {"Key": "RECORD_TYPE",
-                                   "Values": sorted(tax_types)}}}
+                                   "Values": sorted(record_types)}}}
 
 
 def get_account_names():
@@ -171,19 +177,19 @@ def classify_record_types(record_types):
     return tax, credit, spp, bundled
 
 
-def get_net_costs_by_account_service(start, end, tax_types):
-    """CONSOLE basis: {account_id: {service: net_cost}}.
-    Includes usage, fees, Savings Plan records, credits, refunds and every
-    discount record; excludes only Tax (which has its own row). Because
-    Cost Explorer attributes discount and credit records to the service
-    they apply to, each service line comes out NET — exactly how the
-    Bills page presents it."""
+def get_net_costs_by_account_service(start, end, exclude_types):
+    """CONSOLE basis: {account_id: {service: cost}}.
+    Includes usage, fees, Savings Plan records, credits and refunds —
+    Cost Explorer attributes credit records to the service they apply to,
+    so rows stay net of credits like the Bills page. EXCLUDES Tax (own
+    row) and the SPP / bundled-discount record types, which are broken
+    out into their own rows so that Cost + SPP + Bundled = Total."""
     costs = {}
     for (acct, service), amount in _ce_query(
             start, end,
             [{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"},
              {"Type": "DIMENSION", "Key": "SERVICE"}],
-            _not_tax_filter(tax_types)):
+            _exclude_record_types_filter(exclude_types)):
         costs.setdefault(acct, {})
         costs[acct][service] = costs[acct].get(service, 0.0) + amount
     return costs
@@ -192,12 +198,7 @@ def get_net_costs_by_account_service(start, end, tax_types):
 def get_costs_by_account_service(start, end, exclude_record_types):
     """INVOICE basis (legacy): {account_id: {service: gross_cost}} —
     UnblendedCost gross of credits/discounts, Tax excluded."""
-    flt = None
-    if exclude_record_types:
-        flt = {"Not": {"Dimensions": {
-            "Key": "RECORD_TYPE",
-            "Values": sorted(exclude_record_types),
-        }}}
+    flt = _exclude_record_types_filter(exclude_record_types)
     costs = {}
     for (acct, service), amount in _ce_query(
             start, end,
@@ -250,10 +251,14 @@ def _is_data_transfer_usage_type(usage_type):
     return any(m in usage_type for m in DT_UT_MARKERS)
 
 
-def split_data_transfer(start, end, tax_types, costs):
+def split_data_transfer(start, end, exclude_types, costs):
     """Move data-transfer usage types out of their Cost Explorer service
     and into a 'Data Transfer' row, mirroring the Bills page. One extra
-    query per source service (grouped by account + usage type)."""
+    query per source service (grouped by account + usage type).
+
+    MUST use the same record-type exclusions as the main service query —
+    otherwise the amounts moved here would include record types that are
+    not present in the service rows and the split would not balance."""
     if os.environ.get("DATA_TRANSFER_SPLIT", "true").lower() != "true":
         return
     sources = [s.strip() for s in os.environ.get(
@@ -263,9 +268,9 @@ def split_data_transfer(start, end, tax_types, costs):
 
     for svc in sources:
         parts = [{"Dimensions": {"Key": "SERVICE", "Values": [svc]}}]
-        not_tax = _not_tax_filter(tax_types)
-        if not_tax:
-            parts.append(not_tax)
+        excl = _exclude_record_types_filter(exclude_types)
+        if excl:
+            parts.append(excl)
         flt = parts[0] if len(parts) == 1 else {"And": parts}
 
         for (acct, usage_type), amount in _ce_query(
@@ -365,15 +370,18 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
                    cost_basis):
     """
     accounts : ordered list of (account_id, account_name)
-    costs    : {acct: {service: cost}}   (net console view, or legacy gross)
+    costs    : {acct: {service: cost}}  (gross of SPP/bundled; the console
+               basis additionally nets credits/refunds into the rows)
     tax/credits/spp/bundled : {acct: amount}
     cost_basis : "console" or "invoice"
 
-    Console basis per-account sheet:
-        service rows (net) / Tax  -> SubTotal  == console account total
-        SPP + Credits shown BELOW SubTotal as information only (their
-        amounts are already inside the service rows), Total = SubTotal.
-    Invoice basis: legacy layout (gross rows, Total = SubTotal + SPP).
+    Account sheet layout (both bases):
+        service rows / Tax -> SubTotal
+        SPP row and Bundled Discount row (negative amounts)
+        Total = SubTotal + SPP + Bundled
+    On the console basis that Total equals the console's account total,
+    and Credits & Refunds appear below as an informational row (their
+    amounts are already netted into the service rows).
 
     Amounts are written at FULL precision (the money format displays 2 dp)
     so sums match the console to the cent.
@@ -420,52 +428,41 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
         _cell(ws, row, 3, tax.get(acct_id, 0.0), money=True)
         row += 1
 
+        # Service rows are GROSS of SPP/bundled on both bases now, so the
+        # layout is shared: SubTotal, then the two discount rows, then
+        # Total = SubTotal + SPP + Bundled. On the console basis that Total
+        # equals the console's account total (credits are netted into the
+        # service rows and shown below as information only).
+        subtotal_row = row
+        _cell(ws, row, 2, "SubTotal", bold=True)
+        _cell(ws, row, 3, f"=SUM(C3:C{row - 1})", bold=True,
+              money=True, fill=TOTAL_FILL)
+        row += 1
+
+        spp_row = row
+        _cell(ws, row, 2, "SPP", bold=True)
+        _cell(ws, row, 3, spp.get(acct_id, 0.0), money=True)
+        row += 1
+
+        bundled_row = row
+        _cell(ws, row, 2, "Bundled Discount", bold=True)
+        _cell(ws, row, 3, bundled.get(acct_id, 0.0), money=True)
+        row += 1
+
         if net_view:
-            # Console basis: service rows are already net of SPP, bundled
-            # discounts and credits, so SubTotal == the console's account
-            # total. SPP and Credits appear below as information only.
-            subtotal_row = row
-            _cell(ws, row, 2, "SubTotal", bold=True)
-            _cell(ws, row, 3, f"=SUM(C3:C{row - 1})", bold=True,
-                  money=True, fill=TOTAL_FILL)
-            row += 1
-
-            spp_row = row
-            _cell(ws, row, 2, "SPP (already included in costs above)",
-                  bold=True)
-            _cell(ws, row, 3, spp.get(acct_id, 0.0), money=True)
-            row += 1
-
             _cell(ws, row, 2, "Credits & Refunds (already included above)")
             _cell(ws, row, 3, credits.get(acct_id, 0.0), money=True)
             row += 1
 
-            total_row = row
-            _cell(ws, row, 2, "Total", bold=True)
-            _cell(ws, row, 3, f"=C{subtotal_row}", bold=True,
-                  money=True, fill=TOTAL_FILL)
-        else:
-            # Invoice basis (legacy): gross rows, SPP added into Total.
-            subtotal_row = row
-            _cell(ws, row, 2, "SubTotal", bold=True)
-            _cell(ws, row, 3, f"=SUM(C3:C{row - 1})", bold=True,
-                  money=True, fill=TOTAL_FILL)
-            row += 1
-
-            spp_row = row
-            _cell(ws, row, 2, "SPP", bold=True)
-            _cell(ws, row, 3, spp.get(acct_id, 0.0), money=True)
-            row += 1
-
-            total_row = row
-            _cell(ws, row, 2, "Total", bold=True)
-            _cell(ws, row, 3, f"=SUM(C{subtotal_row}:C{spp_row})", bold=True,
-                  money=True, fill=TOTAL_FILL)
+        total_row = row
+        _cell(ws, row, 2, "Total", bold=True)
+        _cell(ws, row, 3, f"=C{subtotal_row}+C{spp_row}+C{bundled_row}",
+              bold=True, money=True, fill=TOTAL_FILL)
 
         _autofit(ws, {"B": 52, "C": 14})
         anchors[acct_id] = dict(
             sheet=sheet_name, subtotal=subtotal_row,
-            spp=spp_row, total=total_row,
+            spp=spp_row, bundled=bundled_row, total=total_row,
         )
 
     n = len(accounts)
@@ -535,11 +532,13 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
                                "SPP Charges", "Bundled Charges"])
     for i, (acct_id, acct_name) in enumerate(accounts):
         r = first + i
+        a = anchors[acct_id]
         _cell(ws_csb, r, 2, acct_name)
         _cell(ws_csb, r, 3, acct_id)
         _cell(ws_csb, r, 4, f"='Total Cost for All Accounts'!D{r}", money=True)
         _cell(ws_csb, r, 5, f"='SPP for All Accounts'!D{r}", money=True)
-        _cell(ws_csb, r, 6, bundled.get(acct_id, 0.0), money=True)
+        _cell(ws_csb, r, 6, f"={_sheet_ref(a['sheet'])}!C{a['bundled']}",
+              money=True)
     sub = last + 1
     _cell(ws_csb, sub, 2, "Sub Total", bold=True)
     _merge(ws_csb, f"B{sub}:C{sub}")
@@ -547,18 +546,11 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
     _cell(ws_csb, sub, 5, f"=SUM(E{first}:E{last})", bold=True, money=True)
     _cell(ws_csb, sub, 6, f"=SUM(F{first}:F{last})", bold=True, money=True)
     tc = sub + 1
-    if net_view:
-        # Cost column is already net of SPP/Bundled — adding columns E and
-        # F again would double-count the discounts.
-        _cell(ws_csb, tc, 2,
-              "Total Cost (SPP & Bundled already included in Cost)",
-              bold=True)
-        _merge(ws_csb, f"B{tc}:C{tc}")
-        _cell(ws_csb, tc, 4, f"=D{sub}", bold=True, money=True)
-    else:
-        _cell(ws_csb, tc, 2, "Total Cost", bold=True)
-        _merge(ws_csb, f"B{tc}:C{tc}")
-        _cell(ws_csb, tc, 4, f"=D{sub}+E{sub}+F{sub}", bold=True, money=True)
+    # Cost is gross of SPP/bundled on both bases now, so the three columns
+    # always add up: Total Cost = Cost + SPP + Bundled = All Total.
+    _cell(ws_csb, tc, 2, "Total Cost", bold=True)
+    _merge(ws_csb, f"B{tc}:C{tc}")
+    _cell(ws_csb, tc, 4, f"=D{sub}+E{sub}+F{sub}", bold=True, money=True)
     ws_csb.cell(row=tc, column=4).alignment = Alignment(horizontal="center")
     _merge(ws_csb, f"D{tc}:F{tc}", fill=TOTAL_FILL)
     _autofit(ws_csb, {"B": 22, "C": 16, "D": 14, "E": 14, "F": 16})
@@ -569,12 +561,9 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
     _header_row(ws_all, 3, 2, ["Account Name", "Account ID", "Total Cost"])
     for i, (acct_id, acct_name) in enumerate(accounts):
         r = first + i
-        if net_view:
-            formula = f"='Cost+SPP+Bundle Discount'!D{r}"
-        else:
-            formula = (f"='Cost+SPP+Bundle Discount'!D{r}"
-                       f"+'Cost+SPP+Bundle Discount'!E{r}"
-                       f"+'Cost+SPP+Bundle Discount'!F{r}")
+        formula = (f"='Cost+SPP+Bundle Discount'!D{r}"
+                   f"+'Cost+SPP+Bundle Discount'!E{r}"
+                   f"+'Cost+SPP+Bundle Discount'!F{r}")
         _cell(ws_all, r, 2, acct_name)
         _cell(ws_all, r, 3, acct_id)
         _cell(ws_all, r, 4, formula, money=True)
@@ -660,11 +649,13 @@ def lambda_handler(event, context):
         start, end, tax_types, credit_types, spp_types, bundled_types)
 
     if cost_basis == "console":
-        # Service rows NET of discounts/credits, grouped/named like the
-        # Bills page. SPP/credits stay available for the info rows and
-        # rollup sheets — their amounts are already inside the service rows.
-        costs = get_net_costs_by_account_service(start, end, tax_types)
-        split_data_transfer(start, end, tax_types, costs)
+        # Service rows net of credits/refunds but GROSS of SPP and bundled
+        # discounts, which get their own rows/columns so that
+        # Cost + SPP + Bundled = Total on every sheet. The data-transfer
+        # split must use the exact same exclusions to stay in balance.
+        exclude = tax_types | spp_types | bundled_types
+        costs = get_net_costs_by_account_service(start, end, exclude)
+        split_data_transfer(start, end, exclude, costs)
         costs = to_console_view(costs)
     else:
         # Legacy invoice basis: gross of credits/discounts.
@@ -679,10 +670,12 @@ def lambda_handler(event, context):
                | set(spp) | set(bundled))
 
     def month_total(a):
-        base = sum(costs.get(a, {}).values()) + tax.get(a, 0.0)
-        if cost_basis == "console":
-            return base   # SPP/bundled/credits already inside service rows
-        return base + spp.get(a, 0.0) + bundled.get(a, 0.0)
+        # Service rows are gross of SPP/bundled on both bases now, so the
+        # discounts are added back here. Credits are netted into the rows
+        # on the console basis and excluded on the invoice basis, so the
+        # console value still equals the console's account total.
+        return (sum(costs.get(a, {}).values()) + tax.get(a, 0.0)
+                + spp.get(a, 0.0) + bundled.get(a, 0.0))
 
     if os.environ.get("ACCOUNT_SORT", "cost").lower() == "name":
         ordered = sorted(all_ids, key=lambda a: names.get(a, a).lower())
