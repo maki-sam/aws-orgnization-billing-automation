@@ -933,7 +933,9 @@ class ExcelReportBuilder:
         return errors
 
     def _write_account_sheets(self, workbook: Workbook, dataset: BillingDataset) -> None:
-        """Each account sheet intentionally contains only Service and Cost."""
+        """Each account sheet: the Service/Cost breakdown plus a
+        SubTotal / SPP / Bundled / Total footer that ties back to the
+        summary sheets (see _cost_spp_bundled)."""
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
             worksheet = workbook.create_sheet(
@@ -963,17 +965,45 @@ class ExcelReportBuilder:
                 worksheet.cell(row, 2, "No service costs returned for this period.")
                 worksheet.cell(row, 3, 0)
                 row += 1
+            last_service_row = row - 1
+
+            # Footer sourced from _cost_spp_bundled so each line equals its
+            # summary sheet exactly:
+            #   SubTotal -> "Total Cost for All Accounts"
+            #   SPP      -> "SPP for All Accounts"
+            #   Bundled  -> "Bundled_Discount"
+            #   Total    -> "All Total"  (= SubTotal + SPP + Bundled)
+            cost, spp, bundled = self._cost_spp_bundled(breakdown)
+
+            subtotal_row = row
+            worksheet.cell(row, 2, "SubTotal").font = Font(bold=True)
+            worksheet.cell(row, 3, float(cost)).font = Font(bold=True)
+            row += 1
+
+            spp_row = row
+            worksheet.cell(row, 2, "SPP").font = Font(bold=True)
+            worksheet.cell(row, 3, float(spp)).font = Font(bold=True)
+            row += 1
+
+            bundled_row = row
+            worksheet.cell(row, 2, "Bundled").font = Font(bold=True)
+            worksheet.cell(row, 3, float(bundled)).font = Font(bold=True)
+            row += 1
 
             worksheet.cell(row, 2, "Total").font = Font(bold=True)
-            worksheet.cell(row, 3, f"=SUM(C4:C{row - 1})").font = Font(bold=True)
-            for column in range(2, 4):
-                worksheet.cell(row, column).fill = self.TOTAL_FILL
-                worksheet.cell(row, column).border = self.TOP_BORDER
+            worksheet.cell(
+                row, 3, f"=C{subtotal_row}+C{spp_row}+C{bundled_row}"
+            ).font = Font(bold=True)
+
+            for footer_row in range(subtotal_row, row + 1):
+                for column in range(2, 4):
+                    worksheet.cell(footer_row, column).fill = self.TOTAL_FILL
+                    worksheet.cell(footer_row, column).border = self.TOP_BORDER
 
             self._currency_cells(worksheet, range(4, row + 1), [3])
             self._set_widths(worksheet, {2: 52, 3: 22})
             worksheet.freeze_panes = "B4"
-            worksheet.auto_filter.ref = f"B3:C{max(3, row - 1)}"
+            worksheet.auto_filter.ref = f"B3:C{max(3, last_service_row)}"
 
     def build(self, dataset: BillingDataset, output_path: str) -> list[str]:
         workbook = Workbook()
