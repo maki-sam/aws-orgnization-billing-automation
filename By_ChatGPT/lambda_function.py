@@ -860,6 +860,7 @@ class ExcelReportBuilder:
         category: str,
         amount_header: str,
         negate: bool = False,
+        use_account_cost: bool = False,
     ) -> None:
         worksheet = self._new_sheet(workbook, sheet_name)
         headers = ["Account Name", "Account ID", amount_header]
@@ -870,7 +871,12 @@ class ExcelReportBuilder:
         row = 4
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
-            amount = self._components(breakdown)[category]
+            if use_account_cost:
+                # The account's Cost, identical to the Cost column on the
+                # Cost+SPP+Bundle Discount sheet (both from _cost_spp_bundled).
+                amount, _, _ = self._cost_spp_bundled(breakdown)
+            else:
+                amount = self._components(breakdown)[category]
             # SPP/bundled are stored as negative discounts; show the positive
             # magnitude when requested.
             if negate:
@@ -982,6 +988,7 @@ class ExcelReportBuilder:
             f"{dataset.month_label} AWS Costs for all accounts",
             "base",
             "Cost",
+            use_account_cost=True,
         )
         self._write_account_category_summary(
             workbook,
