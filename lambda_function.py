@@ -15,9 +15,11 @@ Cost basis (COST_BASIS env var)
     attributes those records to the service they apply to) but GROSS of
     SPP and bundled discounts, which are broken out into their own rows
     so the arithmetic is visible on every sheet:
-      * account sheet:  SubTotal + SPP + Bundled Discount = Total,
-        and Total equals the console's account total
-      * rollup sheet:   Cost + SPP Charges + Bundled Charges = All Total
+      * account sheet:  SubTotal + SPP + Bundled Discount = Total
+        (SPP/Bundled negative here), and Total equals the console total
+      * Cost+SPP+Bundle Discount / All Total: SPP and Bundled are shown
+        as POSITIVE discount magnitudes, and the net total subtracts
+        them:  Cost (gross) - SPP - Bundled = All Total (console net)
       * "Amazon Elastic Compute Cloud - Compute" and "EC2 - Other" are
         merged into one "Elastic Compute Cloud" line like the Bills page
       * data-transfer usage is broken out into its own "Data Transfer"
@@ -535,9 +537,12 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
         a = anchors[acct_id]
         _cell(ws_csb, r, 2, acct_name)
         _cell(ws_csb, r, 3, acct_id)
+        # Cost is the gross service total. SPP and Bundled are shown here as
+        # POSITIVE discount magnitudes (negated from the true negative values
+        # on the account / rollup sheets), so the net Total subtracts them.
         _cell(ws_csb, r, 4, f"='Total Cost for All Accounts'!D{r}", money=True)
-        _cell(ws_csb, r, 5, f"='SPP for All Accounts'!D{r}", money=True)
-        _cell(ws_csb, r, 6, f"={_sheet_ref(a['sheet'])}!C{a['bundled']}",
+        _cell(ws_csb, r, 5, f"=-'SPP for All Accounts'!D{r}", money=True)
+        _cell(ws_csb, r, 6, f"=-{_sheet_ref(a['sheet'])}!C{a['bundled']}",
               money=True)
     sub = last + 1
     _cell(ws_csb, sub, 2, "Sub Total", bold=True)
@@ -546,11 +551,12 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
     _cell(ws_csb, sub, 5, f"=SUM(E{first}:E{last})", bold=True, money=True)
     _cell(ws_csb, sub, 6, f"=SUM(F{first}:F{last})", bold=True, money=True)
     tc = sub + 1
-    # Cost is gross of SPP/bundled on both bases now, so the three columns
-    # always add up: Total Cost = Cost + SPP + Bundled = All Total.
+    # Cost is gross and SPP/Bundled are shown as positive discounts, so the
+    # net Total subtracts them: Total Cost = Cost - SPP - Bundled = console
+    # net = the All Total sheet.
     _cell(ws_csb, tc, 2, "Total Cost", bold=True)
     _merge(ws_csb, f"B{tc}:C{tc}")
-    _cell(ws_csb, tc, 4, f"=D{sub}+E{sub}+F{sub}", bold=True, money=True)
+    _cell(ws_csb, tc, 4, f"=D{sub}-E{sub}-F{sub}", bold=True, money=True)
     ws_csb.cell(row=tc, column=4).alignment = Alignment(horizontal="center")
     _merge(ws_csb, f"D{tc}:F{tc}", fill=TOTAL_FILL)
     _autofit(ws_csb, {"B": 22, "C": 16, "D": 14, "E": 14, "F": 16})
@@ -561,9 +567,11 @@ def build_workbook(label, accounts, costs, tax, credits, spp, bundled,
     _header_row(ws_all, 3, 2, ["Account Name", "Account ID", "Total Cost"])
     for i, (acct_id, acct_name) in enumerate(accounts):
         r = first + i
+        # Cost - SPP - Bundled from the CSB sheet (SPP/Bundled positive there),
+        # i.e. the console net cost for the account.
         formula = (f"='Cost+SPP+Bundle Discount'!D{r}"
-                   f"+'Cost+SPP+Bundle Discount'!E{r}"
-                   f"+'Cost+SPP+Bundle Discount'!F{r}")
+                   f"-'Cost+SPP+Bundle Discount'!E{r}"
+                   f"-'Cost+SPP+Bundle Discount'!F{r}")
         _cell(ws_all, r, 2, acct_name)
         _cell(ws_all, r, 3, acct_id)
         _cell(ws_all, r, 4, formula, money=True)
