@@ -753,9 +753,18 @@ class ExcelReportBuilder:
         row = 4
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
+            components = self._components(breakdown)
             worksheet.cell(row, 2, account.name)
             worksheet.cell(row, 3, account.account_id)
-            worksheet.cell(row, 4, float(breakdown.direct_total))
+            # Total Cost = Cost + SPP + Bundled, matching the three columns of
+            # the Cost+SPP+Bundle Discount sheet: Cost is direct_total, and SPP
+            # and Bundled are the positive discount magnitudes (-spp, -bundled).
+            total_cost = (
+                breakdown.direct_total
+                - components["spp"]
+                - components["bundled"]
+            )
+            worksheet.cell(row, 4, float(total_cost))
             row += 1
 
         worksheet.cell(row, 2, "Total").font = Font(bold=True)
@@ -786,21 +795,19 @@ class ExcelReportBuilder:
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
             components = self._components(breakdown)
-            values: list[Any] = [
-                account.name,
-                account.account_id,
-                components["base"],
-                components["spp"],
-                components["bundled"],
-            ]
-            for column, value in enumerate(values, 2):
-                worksheet.cell(
-                    row,
-                    column,
-                    float(value) if isinstance(value, Decimal) else value,
-                )
+            worksheet.cell(row, 2, account.name)
+            worksheet.cell(row, 3, account.account_id)
+            # Cost uses the same code path as the "All Total" sheet
+            # (breakdown.direct_total), not an Excel cross-sheet reference, so
+            # both sheets derive Cost from one source in code. Change that
+            # source and both sheets follow.
+            worksheet.cell(row, 4, float(breakdown.direct_total))
+            # SPP and Bundled are shown as positive discount magnitudes.
+            worksheet.cell(row, 5, float(-components["spp"]))
+            worksheet.cell(row, 6, float(-components["bundled"]))
             row += 1
 
+        sub_row = row
         worksheet.cell(row, 2, "Sub Total").font = Font(bold=True)
         for column in range(4, 7):
             letter = get_column_letter(column)
@@ -810,16 +817,20 @@ class ExcelReportBuilder:
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
 
-        # Same figure as the "All Total" sheet's Total row, referenced directly
-        # so the two sheets can never disagree. That cell sits one row below
-        # the per-account rows, which both sheets draw from dataset.accounts.
-        all_total_row = 4 + len(dataset.accounts)
+        # Total Cost = Cost + SPP + Bundled taken from the Sub Total row. SPP
+        # and Bundled are positive here, so this is the gross-of-discounts
+        # figure. Shown as one merged cell spanning the three money columns.
         row += 1
         worksheet.cell(row, 2, "Total Cost").font = Font(bold=True)
-        worksheet.cell(row, 4, f"='All Total'!D{all_total_row}").font = Font(bold=True)
+        total_formula = (
+            f"=D{sub_row}+E{sub_row}+F{sub_row}" if sub_row > 4 else 0
+        )
+        worksheet.cell(row, 4, total_formula).font = Font(bold=True)
         for column in range(2, 7):
             worksheet.cell(row, column).fill = self.TOTAL_FILL
             worksheet.cell(row, column).border = self.TOP_BORDER
+        worksheet.merge_cells(start_row=row, start_column=2, end_row=row, end_column=3)
+        worksheet.merge_cells(start_row=row, start_column=4, end_row=row, end_column=6)
 
         self._currency_cells(worksheet, range(4, row + 1), range(4, 7))
         self._set_widths(
@@ -837,6 +848,7 @@ class ExcelReportBuilder:
         title: str,
         category: str,
         amount_header: str,
+        negate: bool = False,
     ) -> None:
         worksheet = self._new_sheet(workbook, sheet_name)
         headers = ["Account Name", "Account ID", amount_header]
@@ -848,6 +860,10 @@ class ExcelReportBuilder:
         for account in dataset.accounts:
             breakdown = dataset.account_breakdowns[account.account_id]
             amount = self._components(breakdown)[category]
+            # SPP/bundled are stored as negative discounts; show the positive
+            # magnitude when requested.
+            if negate:
+                amount = -amount
             worksheet.cell(row, 2, account.name)
             worksheet.cell(row, 3, account.account_id)
             worksheet.cell(row, 4, float(amount))
@@ -963,6 +979,7 @@ class ExcelReportBuilder:
             f"{dataset.month_label} Solution Provider Program Discounts",
             "spp",
             "SPP Discounts",
+            negate=True,
         )
         self._write_account_category_summary(
             workbook,
@@ -971,6 +988,7 @@ class ExcelReportBuilder:
             f"{dataset.month_label} Bundled Discounts",
             "bundled",
             "Bundled Discount",
+            negate=True,
         )
         reconciliation_errors = self._reconciliation_errors(dataset)
         self._write_account_sheets(workbook, dataset)
